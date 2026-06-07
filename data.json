@@ -1,0 +1,25 @@
+{
+  "1375422397003464735": {
+    "balance": 999999998600,
+    "deposited": 0,
+    "loggedIn": true,
+    "shop": "ร้านขนมปังอบชีสส",
+    "shopOpen": true,
+    "home": null,
+    "homeChannelId": null,
+    "lastWork": 1779750931691,
+    "settings": {
+      "bio": "แอดมินLol"
+    }
+  },
+  "1494858902464893038": {
+    "balance": 0,
+    "deposited": 0,
+    "loggedIn": false,
+    "shop": null,
+    "shopOpen": false,
+    "home": null,
+    "homeChannelId": null,
+    "lastWork": null
+  }
+}

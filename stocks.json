@@ -1,0 +1,104 @@
+{
+  "SKBD": {
+    "symbol": "SKBD",
+    "name": "Skibidi Corp",
+    "emoji": "🤖",
+    "sector": "เทคโนโลยี",
+    "price": 442,
+    "prevPrice": 454,
+    "change": -2.64,
+    "history": [
+      472,
+      466,
+      449,
+      454,
+      442
+    ],
+    "volume": 0
+  },
+  "BREAD": {
+    "symbol": "BREAD",
+    "name": "ขนมปังอบชีส",
+    "emoji": "🍞",
+    "sector": "อาหาร",
+    "price": 149,
+    "prevPrice": 145,
+    "change": 2.76,
+    "history": [
+      151,
+      146,
+      144,
+      145,
+      149
+    ],
+    "volume": 0
+  },
+  "GOLD": {
+    "symbol": "GOLD",
+    "name": "ทองคำไทย",
+    "emoji": "🥇",
+    "sector": "สินค้าโภคภัณฑ์",
+    "price": 990,
+    "prevPrice": 1002,
+    "change": -1.2,
+    "history": [
+      1018,
+      981,
+      971,
+      1002,
+      990
+    ],
+    "volume": 0
+  },
+  "DBANK": {
+    "symbol": "DBANK",
+    "name": "ธนาคารดิจิทัล",
+    "emoji": "🏦",
+    "sector": "การเงิน",
+    "price": 700,
+    "prevPrice": 719,
+    "change": -2.64,
+    "history": [
+      709,
+      699,
+      724,
+      719,
+      700
+    ],
+    "volume": 0
+  },
+  "FARM": {
+    "symbol": "FARM",
+    "name": "เกษตรไทย",
+    "emoji": "🌾",
+    "sector": "เกษตร",
+    "price": 203,
+    "prevPrice": 201,
+    "change": 1,
+    "history": [
+      199,
+      204,
+      207,
+      201,
+      203
+    ],
+    "volume": 0
+  },
+  "TECH": {
+    "symbol": "TECH",
+    "name": "TechBot Inc",
+    "emoji": "💻",
+    "sector": "IT",
+    "price": 342,
+    "prevPrice": 330,
+    "change": 3.64,
+    "history": [
+      305,
+      309,
+      318,
+      330,
+      342
+    ],
+    "volume": 0
+  }
+}
