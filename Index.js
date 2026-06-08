@@ -19,16 +19,46 @@ const CLIENT_ID = process.env.CLIENT_ID;
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// Session จะหมดเมื่อบอทรีสตาร์ท
-const activeSessions = new Set();
+const SESSION_TIMEOUT = 5 * 60 * 1000; // 5 นาที
+
+// Map: userId → lastActiveTimestamp
+const activeSessions = new Map();
+
+// pendingJobOffers: offerId → { ownerId, targetId, role, shopName, sentAt }
+const pendingJobOffers = new Map();
 
 function hashPassword(pw) {
     return crypto.createHash('sha256').update(pw + 'econ_salt_2025').digest('hex');
 }
 
-const DATA_FILE = './data.json';
-const CONFIG_FILE = './config.json';
-const STOCKS_FILE = './stocks.json';
+function isSessionActive(userId) {
+    if (!activeSessions.has(userId)) return false;
+    const lastActive = activeSessions.get(userId);
+    if (Date.now() - lastActive > SESSION_TIMEOUT) {
+        activeSessions.delete(userId);
+        return false;
+    }
+    return true;
+}
+
+function touchSession(userId) {
+    if (activeSessions.has(userId)) {
+        activeSessions.set(userId, Date.now());
+    }
+}
+
+// ล้าง session ที่หมดอายุทุก 1 นาที
+setInterval(() => {
+    const now = Date.now();
+    for (const [uid, lastActive] of activeSessions.entries()) {
+        if (now - lastActive > SESSION_TIMEOUT) activeSessions.delete(uid);
+    }
+}, 60_000);
+
+const DATA_FILE    = './data.json';
+const CONFIG_FILE  = './config.json';
+const STOCKS_FILE  = './stocks.json';
+const LOTTERY_FILE = './lottery.json';
 
 // ─── Data helpers ─────────────────────────────────────────────────────────────
 
@@ -43,6 +73,58 @@ function loadConfig() {
     return JSON.parse(fs.readFileSync(CONFIG_FILE));
 }
 function saveConfig(c) { fs.writeFileSync(CONFIG_FILE, JSON.stringify(c, null, 2)); }
+
+function loadLottery() {
+    if (!fs.existsSync(LOTTERY_FILE)) {
+        const init = { pool: 0, tickets: [], lastDraw: null, lastResult: null };
+        fs.writeFileSync(LOTTERY_FILE, JSON.stringify(init, null, 2));
+    }
+    return JSON.parse(fs.readFileSync(LOTTERY_FILE));
+}
+function saveLottery(l) { fs.writeFileSync(LOTTERY_FILE, JSON.stringify(l, null, 2)); }
+
+function msTillMidnightBKK() {
+    const now = Date.now();
+    const bkk = new Date(now + 7 * 3600_000);
+    const midnight = Date.UTC(bkk.getUTCFullYear(), bkk.getUTCMonth(), bkk.getUTCDate() + 1) - 7 * 3600_000;
+    return midnight - now;
+}
+
+async function runLotteryDraw() {
+    const lottery = loadLottery();
+    if (!lottery.tickets.length) {
+        lottery.lastResult = { drawn: null, winners: [], prize: 0, note: 'ไม่มีผู้ซื้อสลากวันนี้' };
+        lottery.lastDraw = Date.now();
+        lottery.tickets = [];
+        saveLottery(lottery);
+        scheduleLotteryDraw();
+        return;
+    }
+    const drawnNumber = Math.floor(Math.random() * 99) + 1;
+    const winners = lottery.tickets.filter(t => t.number === drawnNumber);
+    const prizePool = Math.floor(lottery.pool * 0.7);
+
+    if (winners.length) {
+        const share = Math.floor(prizePool / winners.length);
+        for (const w of winners) {
+            const ud = getUser(w.userId);
+            updateUser(w.userId, { balance: ud.balance + share });
+        }
+        lottery.lastResult = { drawn: drawnNumber, winners: winners.map(w => ({ userId: w.userId, charName: w.charName })), prize: share };
+        lottery.pool = 0;
+    } else {
+        lottery.lastResult = { drawn: drawnNumber, winners: [], prize: 0, note: 'ไม่มีผู้ถูกรางวัล — พูลสะสมต่อไป' };
+    }
+    lottery.lastDraw = Date.now();
+    lottery.tickets = [];
+    saveLottery(lottery);
+    scheduleLotteryDraw();
+}
+
+function scheduleLotteryDraw() {
+    const ms = msTillMidnightBKK();
+    setTimeout(runLotteryDraw, ms);
+}
 
 function loadStocks() {
     if (!fs.existsSync(STOCKS_FILE)) {
@@ -69,17 +151,37 @@ function updateUser(userId, updates) {
     const d = loadData(); d[userId] = { ...d[userId], ...updates }; saveData(d);
 }
 
+// หา userId จากชื่อบัญชี (case-insensitive)
+function findUserIdByCharName(charName) {
+    const d = loadData();
+    const lower = charName.toLowerCase();
+    for (const [uid, ud] of Object.entries(d)) {
+        if (ud.charName && ud.charName.toLowerCase() === lower) return uid;
+    }
+    return null;
+}
+
+// ตั้ง nickname ในเซิร์ฟเวอร์ (ข้ามถ้าไม่มีสิทธิ์หรือไม่อยู่ใน guild)
+async function trySetNickname(interaction, charName) {
+    try {
+        if (interaction.member && interaction.guild) {
+            await interaction.member.setNickname(charName);
+        }
+    } catch { /* บอทไม่มีสิทธิ์ หรือเป็น server owner — ข้ามได้ */ }
+}
+
 function requireLogin(interaction) {
     const uid = interaction.user.id;
     const u = getUser(uid);
-    if (!u.loggedIn || !activeSessions.has(uid)) {
+    if (!u.loggedIn || !isSessionActive(uid)) {
         interaction.reply({
             embeds: [new EmbedBuilder().setColor(0xff0000).setTitle('❌ ยังไม่ได้เข้าสู่ระบบ')
-                .setDescription(u.loggedIn ? 'Session หมดอายุแล้ว กรุณากด `/panel` → **🔐 เข้าสู่ระบบ** อีกครั้ง' : 'กรุณาใช้ `/panel` → **📝 สมัครสมาชิก** ก่อนใช้งาน')],
+                .setDescription(u.loggedIn ? '⏰ Session หมดอายุเพราะไม่ได้ใช้งาน 5 นาที\nกรุณากด `/panel` → **🔐 เข้าสู่ระบบ** อีกครั้ง' : 'กรุณาใช้ `/panel` → **📝 สมัครสมาชิก** ก่อนใช้งาน')],
             ephemeral: true,
         });
         return false;
     }
+    touchSession(uid);
     return true;
 }
 
@@ -208,6 +310,8 @@ const commands = [
     new SlashCommandBuilder().setName('job').setDescription('ดูรายการอาชีพ'),
     new SlashCommandBuilder().setName('help').setDescription('ดูคำสั่งทั้งหมด'),
 
+    new SlashCommandBuilder().setName('lottery').setDescription('ดูข้อมูลลอตเตอรี่รายวัน'),
+
     new SlashCommandBuilder().setName('setdeposit').setDescription('[แอดมิน] ตั้งช่องแจ้งเตือนฝากเงิน')
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
         .addChannelOption(o => o.setName('channel').setDescription('ช่อง').setRequired(true)),
@@ -237,6 +341,8 @@ client.once('ready', async () => {
     console.log(`✅ Online: ${client.user.tag}`);
     await registerCommands();
     setInterval(updateStockPrices, 5 * 60 * 1000);
+    scheduleLotteryDraw();
+    console.log(`🎰 ลอตเตอรี่ครั้งถัดไป: อีก ${Math.round(msTillMidnightBKK() / 60_000)} นาที`);
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -263,6 +369,7 @@ function buildMainPanel(userId) {
             { name: '🏠 บ้าน', value: 'ซื้อบ้าน, เชิญ, เตะ', inline: true },
             { name: '📊 หุ้น', value: 'ซื้อ/ขายหุ้น, พอร์ต', inline: true },
             { name: '📲 QR', value: 'สร้าง/สแกน QR', inline: true },
+            { name: '🎰 ลอตเตอรี่', value: 'ซื้อสลาก, ดูผล', inline: true },
         )
         .setFooter({ text: 'กดปุ่มด้านล่างเพื่อเข้าระบบที่ต้องการ' })
         .setTimestamp();
@@ -281,15 +388,18 @@ function buildMainPanel(userId) {
         new ButtonBuilder().setCustomId('panel_qr').setLabel('📲 QR').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('panel_refresh').setLabel('🔄 รีเฟรช').setStyle(ButtonStyle.Secondary),
     );
+    const row3 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('panel_lottery').setLabel('🎰 ลอตเตอรี่รายวัน').setStyle(ButtonStyle.Success),
+    );
 
-    return { embeds: [embed], components: [row1, row2], ephemeral: true };
+    return { embeds: [embed], components: [row1, row2, row3], ephemeral: true };
 }
 
 function buildCharacterPanel(userId) {
     const ud = getUser(userId);
     const job = ud.jobKey ? JOBS[ud.jobKey] : null;
     const hasAccount = ud.loggedIn; // มีบัญชีในระบบแล้ว
-    const hasSession = activeSessions.has(userId); // session ใช้งานอยู่
+    const hasSession = isSessionActive(userId); // session ใช้งานอยู่
 
     let statusText;
     if (!hasAccount) {
@@ -509,6 +619,51 @@ function buildQRPanel(userId) {
     return { embeds: [embed], components: [row], ephemeral: true };
 }
 
+function buildLotteryPanel(userId) {
+    const ud = getUser(userId);
+    const lottery = loadLottery();
+
+    // เวลาที่เหลือถึงเที่ยงคืน
+    const ms = msTillMidnightBKK();
+    const hours = Math.floor(ms / 3600_000);
+    const mins  = Math.floor((ms % 3600_000) / 60_000);
+
+    const myTickets = lottery.tickets.filter(t => t.userId === userId);
+
+    let lastText = '—';
+    const r = lottery.lastResult;
+    if (r) {
+        if (!r.drawn) {
+            lastText = r.note || '—';
+        } else if (r.winners.length) {
+            const nameList = r.winners.map(w => w.charName).join(', ');
+            lastText = `🎯 เลขออก: **${r.drawn}**\n🏆 ผู้ชนะ: ${nameList}\n💰 รางวัล: ${r.prize.toLocaleString()} บาท/คน`;
+        } else {
+            lastText = `🎯 เลขออก: **${r.drawn}**\n😢 ${r.note}`;
+        }
+    }
+
+    const embed = new EmbedBuilder()
+        .setColor(0xffd700)
+        .setTitle('🎰 Panel — ลอตเตอรี่รายวัน')
+        .setDescription('เลือกเลข 1–99 ราคา **100 บาท/ใบ** • ออกรางวัลเที่ยงคืน\nผู้ชนะแบ่งกัน **70%** ของพูล')
+        .addFields(
+            { name: '💰 พูลสะสมวันนี้', value: `${lottery.pool.toLocaleString()} บาท`, inline: true },
+            { name: '⏰ ออกรางวัลใน', value: `${hours} ชม. ${mins} นาที`, inline: true },
+            { name: '🎟️ สลากของคุณวันนี้', value: myTickets.length ? myTickets.map(t => `เลข **${t.number}**`).join(' • ') : '(ยังไม่ซื้อ)', inline: false },
+            { name: '📋 ผลรางวัลล่าสุด', value: lastText, inline: false },
+        )
+        .setFooter({ text: `กระเป๋า: ${ud.balance.toLocaleString()} บาท` })
+        .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('action_lottery_buy').setLabel('🎟️ ซื้อสลาก 100 บาท').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('panel_main').setLabel('↩ กลับ').setStyle(ButtonStyle.Secondary),
+    );
+
+    return { embeds: [embed], components: [row], ephemeral: true };
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // INTERACTION HANDLER
 // ════════════════════════════════════════════════════════════════════════════════
@@ -533,7 +688,7 @@ client.on('interactionCreate', async interaction => {
 
             // มีบัญชีแล้ว — เช็ครหัสผ่าน
             if (ud.loggedIn) {
-                if (activeSessions.has(user.id)) {
+                if (isSessionActive(user.id)) {
                     const j = JOBS[ud.jobKey] || JOBS.farmer;
                     return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('✅ เข้าสู่ระบบอยู่แล้ว').setDescription(`ยินดีต้อนรับ **${ud.charName}**!\n${j.emoji} ${j.name} | 💵 ${ud.balance.toLocaleString()} บาท`)], ephemeral: true });
                 }
@@ -812,6 +967,21 @@ client.on('interactionCreate', async interaction => {
         if (commandName === 'help') {
             return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📖 ช่วยเหลือ').setDescription('ใช้ `/panel` เพื่อเข้าสู่ระบบทั้งหมดผ่านปุ่ม!\n\nหรือใช้ slash commands ตรงๆ ด้านล่าง').addFields({ name: '👤 ตัวละคร', value: '`/login` `/balance` `/work` `/give` `/profile`', inline: false }, { name: '🏪 ร้านค้า', value: '`/newshop` `/openshop` `/closeshop` `/menu` `/order`', inline: false }, { name: '📦 สต็อก', value: '`/addmenu` `/removemenu` `/restock` `/inventory`', inline: false }, { name: '👥 พนักงาน', value: '`/hire` `/fire` `/staff`', inline: false }, { name: '🏠 บ้าน', value: '`/newhome` `/invite` `/uninvite`', inline: false }, { name: '💰 การเงิน', value: '`/deploysit` `/withdraw` `/qrscan` `/scanqr`', inline: false }, { name: '📊 หุ้น', value: '`/stock list/buy/sell/portfolio`', inline: false }).setFooter({ text: '💡 แนะนำ: ใช้ /panel สะดวกกว่า!' }).setTimestamp()] });
         }
+        if (commandName === 'lottery') {
+            const lottery = loadLottery();
+            const ms = msTillMidnightBKK();
+            const hours = Math.floor(ms / 3600_000);
+            const mins  = Math.floor((ms % 3600_000) / 60_000);
+            const r = lottery.lastResult;
+            let lastText = '—';
+            if (r) {
+                if (!r.drawn) lastText = r.note || '—';
+                else if (r.winners.length) lastText = `🎯 เลขออก: **${r.drawn}** — ผู้ชนะ: ${r.winners.map(w => w.charName).join(', ')} (+${r.prize.toLocaleString()} บาท)`;
+                else lastText = `🎯 เลขออก: **${r.drawn}** — ${r.note}`;
+            }
+            return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xffd700).setTitle('🎰 ลอตเตอรี่รายวัน').setDescription('ซื้อสลากผ่าน `/panel` → **🎰 ลอตเตอรี่รายวัน**').addFields({ name: '💰 พูลสะสมวันนี้', value: `${lottery.pool.toLocaleString()} บาท`, inline: true }, { name: '⏰ ออกรางวัลใน', value: `${hours} ชม. ${mins} นาที`, inline: true }, { name: '🎟️ ใบที่ขายไปแล้ว', value: `${lottery.tickets.length} ใบ`, inline: true }, { name: '📋 ผลล่าสุด', value: lastText }).setFooter({ text: 'ราคา 100 บาท/ใบ • เลข 1–99 • ผู้ชนะรับ 70%' }).setTimestamp()], ephemeral: true });
+        }
+
         if (commandName === 'setdeposit') {
             const ch = interaction.options.getChannel('channel');
             const cfg = loadConfig(); if (!cfg[interaction.guildId]) cfg[interaction.guildId] = {}; cfg[interaction.guildId].depositChannelId = ch.id; saveConfig(cfg);
@@ -869,12 +1039,26 @@ client.on('interactionCreate', async interaction => {
             if (!getUser(user.id).loggedIn) return interaction.update(buildCharacterPanel(user.id));
             return interaction.update(buildStockPanel(user.id));
         }
+        if (customId === 'panel_lottery') {
+            if (!getUser(user.id).loggedIn) return interaction.update(buildCharacterPanel(user.id));
+            return interaction.update(buildLotteryPanel(user.id));
+        }
         if (customId === 'panel_qr') {
             if (!getUser(user.id).loggedIn) return interaction.update(buildCharacterPanel(user.id));
             return interaction.update(buildQRPanel(user.id));
         }
 
         // ── Actions (open modals) ─────────────────────────────────────────────
+        if (customId === 'action_lottery_buy') {
+            if (!requireLogin(interaction)) return;
+            const modal = new ModalBuilder().setCustomId('modal_lottery_buy').setTitle('🎟️ ซื้อสลากลอตเตอรี่');
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('number').setLabel('เลือกเลข 1–99').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(1).setMaxLength(2).setPlaceholder('เช่น 7 หรือ 42')),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('qty').setLabel('จำนวนใบ (1–10 ใบ) ราคา 100 บาท/ใบ').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(1).setMaxLength(2).setPlaceholder('เช่น 1')),
+            );
+            return interaction.showModal(modal);
+        }
+
         if (customId === 'action_register') {
             const modal = new ModalBuilder().setCustomId('modal_register').setTitle('📝 สมัครสมาชิก');
             modal.addComponents(
@@ -1003,9 +1187,9 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (customId === 'action_hire') {
-            const modal = new ModalBuilder().setCustomId('modal_hire').setTitle('➕ รับพนักงาน');
+            const modal = new ModalBuilder().setCustomId('modal_hire').setTitle('➕ เสนองาน');
             modal.addComponents(
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('user_id').setLabel('Discord ID ของพนักงาน (คลิกขวา → Copy ID)').setStyle(TextInputStyle.Short).setRequired(true)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('char_name').setLabel('ชื่อบัญชีผู้รับ (charName)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น นายโปรแกรมเมอร์')),
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('role').setLabel('ตำแหน่ง').setStyle(TextInputStyle.Short).setRequired(false).setPlaceholder('เช่น พ่อครัว, แคชเชียร์')),
             );
             return interaction.showModal(modal);
@@ -1013,8 +1197,75 @@ client.on('interactionCreate', async interaction => {
 
         if (customId === 'action_fire') {
             const modal = new ModalBuilder().setCustomId('modal_fire').setTitle('❌ ไล่พนักงานออก');
-            modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('user_id').setLabel('Discord ID พนักงานที่จะไล่ออก').setStyle(TextInputStyle.Short).setRequired(true)));
+            modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('char_name').setLabel('ชื่อบัญชีพนักงานที่จะไล่ออก (charName)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น นายโปรแกรมเมอร์')));
             return interaction.showModal(modal);
+        }
+
+        // ── Job offer responses (มาจาก DM) ──────────────────────────────────
+        if (customId.startsWith('job_accept:') || customId.startsWith('job_decline:')) {
+            const offerId   = customId.split(':')[1];
+            const offer     = pendingJobOffers.get(offerId);
+            const isAccept  = customId.startsWith('job_accept:');
+
+            if (!offer) {
+                return interaction.update({
+                    embeds: [new EmbedBuilder().setColor(0xed4245).setTitle('⏰ คำเชิญหมดอายุแล้ว').setDescription('บอทรีสตาร์ทไปแล้ว คำเชิญนี้ใช้ไม่ได้อีกต่อไป')],
+                    components: [],
+                });
+            }
+
+            // ต้องเป็นคนที่รับ offer เท่านั้น
+            if (user.id !== offer.targetId) {
+                return interaction.reply({ content: '❌ คำเชิญนี้ไม่ได้มาถึงคุณ!', ephemeral: true });
+            }
+
+            pendingJobOffers.delete(offerId);
+
+            if (!isAccept) {
+                // ── ปฏิเสธ ──
+                await interaction.update({
+                    embeds: [new EmbedBuilder().setColor(0xed4245).setTitle('❌ ปฏิเสธงานแล้ว').setDescription(`คุณปฏิเสธตำแหน่ง **${offer.role}** ที่ร้าน **${offer.shopName}**`)],
+                    components: [],
+                });
+                try {
+                    const owner = await client.users.fetch(offer.ownerId);
+                    await owner.send({ embeds: [new EmbedBuilder().setColor(0xed4245).setTitle('❌ คำเชิญถูกปฏิเสธ').setDescription(`<@${offer.targetId}> ปฏิเสธตำแหน่ง **${offer.role}** ที่ร้าน **${offer.shopName}**`).setTimestamp()] });
+                } catch {}
+                return;
+            }
+
+            // ── รับงาน ──
+            const ownerData = getUser(offer.ownerId);
+            const targetData = getUser(offer.targetId);
+            const staff = ownerData.shopStaff || [];
+
+            if (staff.find(s => s.id === offer.targetId)) {
+                return interaction.update({ embeds: [new EmbedBuilder().setColor(0xed4245).setTitle('❌ คุณเป็นพนักงานอยู่แล้ว').setDescription('มีคนอื่นเพิ่งรับคุณเข้ามาแล้ว')], components: [] });
+            }
+
+            staff.push({ id: offer.targetId, name: targetData.charName || user.username, role: offer.role, hiredAt: Date.now() });
+            updateUser(offer.ownerId, { shopStaff: staff });
+
+            // เปิดสิทธิ์ห้องครัว
+            if (ownerData.kitchenChannelId) {
+                try {
+                    const kitchen = await client.channels.fetch(ownerData.kitchenChannelId);
+                    await kitchen.permissionOverwrites.edit(offer.targetId, { [PermissionFlagsBits.ViewChannel]: true, [PermissionFlagsBits.SendMessages]: true, [PermissionFlagsBits.ReadMessageHistory]: true });
+                    await kitchen.send({ embeds: [new EmbedBuilder().setColor(0x00cc66).setDescription(`👋 ยินดีต้อนรับ <@${offer.targetId}> ในฐานะ **${offer.role}**!`).setTimestamp()] });
+                } catch {}
+            }
+
+            await interaction.update({
+                embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('✅ รับงานสำเร็จ!').setDescription(`คุณได้เป็นพนักงานร้าน **${offer.shopName}** แล้ว 🎉`).addFields({ name: '👔 ตำแหน่ง', value: offer.role, inline: true }).setTimestamp()],
+                components: [],
+            });
+
+            // แจ้งเจ้าของร้าน
+            try {
+                const owner = await client.users.fetch(offer.ownerId);
+                await owner.send({ embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('🎉 มีพนักงานใหม่!').setDescription(`<@${offer.targetId}> รับตำแหน่ง **${offer.role}** ที่ร้าน **${offer.shopName}** แล้ว`).addFields({ name: '👥 พนักงานรวม', value: `${staff.length} คน`, inline: true }).setTimestamp()] });
+            } catch {}
+            return;
         }
 
         if (customId === 'action_newhome') {
@@ -1094,7 +1345,8 @@ client.on('interactionCreate', async interaction => {
             if (!JOBS[jobKey]) return interaction.reply({ content: `❌ อาชีพ "${jobKey}" ไม่ถูกต้อง!\nใช้: chef, builder, driver, programmer, delivery, farmer, trader, doctor`, ephemeral: true });
             const job = JOBS[jobKey];
             updateUser(user.id, { loggedIn: true, balance: job.start, charName, jobKey, passwordHash: hashPassword(password) });
-            activeSessions.add(user.id);
+            activeSessions.set(user.id, Date.now());
+            await trySetNickname(interaction, charName);
             await interaction.reply({
                 embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('🎉 สมัครสมาชิกสำเร็จ!')
                     .setThumbnail(user.displayAvatarURL({ size: 256 }))
@@ -1116,13 +1368,14 @@ client.on('interactionCreate', async interaction => {
         if (customId === 'modal_login') {
             const ud = getUser(user.id);
             if (!ud.loggedIn) return interaction.reply({ content: '❌ ยังไม่มีบัญชี! กด **📝 สมัครสมาชิก** ก่อน', ephemeral: true });
-            if (activeSessions.has(user.id)) return interaction.reply({ content: '✅ เข้าสู่ระบบอยู่แล้ว!', ephemeral: true });
+            if (isSessionActive(user.id)) return interaction.reply({ content: '✅ เข้าสู่ระบบอยู่แล้ว!', ephemeral: true });
 
             const password = interaction.fields.getTextInputValue('password');
             if (!ud.passwordHash) {
                 // บัญชีเก่าที่ยังไม่มีรหัส — ตั้งรหัสใหม่ได้เลย
                 updateUser(user.id, { passwordHash: hashPassword(password) });
-                activeSessions.add(user.id);
+                activeSessions.set(user.id, Date.now());
+                await trySetNickname(interaction, ud.charName);
                 return interaction.reply({
                     embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('🔐 ตั้งรหัสผ่านและเข้าสู่ระบบสำเร็จ!')
                         .setDescription(`ยินดีต้อนรับกลับ **${ud.charName}**!\nรหัสผ่านถูกตั้งค่าเรียบร้อยแล้ว`)
@@ -1135,7 +1388,8 @@ client.on('interactionCreate', async interaction => {
                 return interaction.reply({ content: '❌ รหัสผ่านไม่ถูกต้อง! ลองใหม่อีกครั้ง', ephemeral: true });
             }
 
-            activeSessions.add(user.id);
+            activeSessions.set(user.id, Date.now());
+            await trySetNickname(interaction, ud.charName);
             const job = JOBS[ud.jobKey];
             return interaction.reply({
                 embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('✅ เข้าสู่ระบบสำเร็จ!')
@@ -1244,21 +1498,27 @@ client.on('interactionCreate', async interaction => {
 
         // ── Staff ─────────────────────────────────────────────────────────────
         if (customId === 'modal_hire') {
-            const targetId = interaction.fields.getTextInputValue('user_id').trim();
+            const charName = interaction.fields.getTextInputValue('char_name').trim();
             const role = interaction.fields.getTextInputValue('role').trim() || 'พนักงาน';
+            const targetId = findUserIdByCharName(charName);
+            if (!targetId) return interaction.reply({ content: `❌ ไม่พบบัญชีชื่อ **${charName}**\nตรวจสอบชื่อให้ถูกต้อง (ต้องตรงทุกตัวอักษร)`, ephemeral: true });
             try {
                 const targetUser = await client.users.fetch(targetId);
                 await handleHire(interaction, targetUser, role);
-            } catch { return interaction.reply({ content: '❌ ไม่พบ Discord ID นี้!', ephemeral: true }); }
+            } catch { return interaction.reply({ content: '❌ เกิดข้อผิดพลาดในการดึงข้อมูลผู้ใช้!', ephemeral: true }); }
             return;
         }
 
         if (customId === 'modal_fire') {
-            const targetId = interaction.fields.getTextInputValue('user_id').trim();
+            const charName = interaction.fields.getTextInputValue('char_name').trim();
+            const ud = getUser(user.id);
+            const staff = ud.shopStaff || [];
+            const member = staff.find(s => s.name && s.name.toLowerCase() === charName.toLowerCase());
+            if (!member) return interaction.reply({ content: `❌ ไม่พบพนักงานชื่อ **${charName}** ในร้านของคุณ`, ephemeral: true });
             try {
-                const targetUser = await client.users.fetch(targetId);
+                const targetUser = await client.users.fetch(member.id);
                 await handleFire(interaction, targetUser);
-            } catch { return interaction.reply({ content: '❌ ไม่พบ Discord ID นี้!', ephemeral: true }); }
+            } catch { return interaction.reply({ content: '❌ เกิดข้อผิดพลาดในการดึงข้อมูลผู้ใช้!', ephemeral: true }); }
             return;
         }
 
@@ -1293,6 +1553,51 @@ client.on('interactionCreate', async interaction => {
         }
 
         // ── Stock ─────────────────────────────────────────────────────────────
+        // ── Lottery buy ────────────────────────────────────────────────────────
+        if (customId === 'modal_lottery_buy') {
+            if (!requireLogin(interaction)) return;
+            const ud = getUser(user.id);
+            const numRaw = interaction.fields.getTextInputValue('number').trim();
+            const qtyRaw = interaction.fields.getTextInputValue('qty').trim();
+            const num = parseInt(numRaw);
+            const qty = parseInt(qtyRaw);
+
+            if (isNaN(num) || num < 1 || num > 99)
+                return interaction.reply({ content: '❌ เลขต้องอยู่ระหว่าง **1–99** เท่านั้น!', ephemeral: true });
+            if (isNaN(qty) || qty < 1 || qty > 10)
+                return interaction.reply({ content: '❌ จำนวนใบต้องอยู่ระหว่าง **1–10**!', ephemeral: true });
+
+            const cost = 100 * qty;
+            if (ud.balance < cost)
+                return interaction.reply({ content: `❌ เงินไม่พอ! ต้องใช้ **${cost.toLocaleString()} บาท** มีแค่ ${ud.balance.toLocaleString()} บาท`, ephemeral: true });
+
+            const lottery = loadLottery();
+            for (let i = 0; i < qty; i++) {
+                lottery.tickets.push({ userId: user.id, charName: ud.charName, number: num, boughtAt: Date.now() });
+            }
+            lottery.pool += cost;
+            saveLottery(lottery);
+            updateUser(user.id, { balance: ud.balance - cost });
+
+            const ms = msTillMidnightBKK();
+            const hours = Math.floor(ms / 3600_000);
+            const mins  = Math.floor((ms % 3600_000) / 60_000);
+
+            return interaction.reply({
+                embeds: [new EmbedBuilder().setColor(0xffd700).setTitle('🎟️ ซื้อสลากสำเร็จ!')
+                    .setDescription(`เลือกเลข **${num}** จำนวน **${qty} ใบ**`)
+                    .addFields(
+                        { name: '💸 จ่ายไป', value: `${cost.toLocaleString()} บาท`, inline: true },
+                        { name: '💵 กระเป๋าคงเหลือ', value: `${(ud.balance - cost).toLocaleString()} บาท`, inline: true },
+                        { name: '💰 พูลรวมตอนนี้', value: `${lottery.pool.toLocaleString()} บาท`, inline: true },
+                        { name: '⏰ ออกรางวัลใน', value: `${hours} ชม. ${mins} นาที`, inline: true },
+                    )
+                    .setFooter({ text: 'ขอให้โชคดี! 🍀 ผู้ชนะรับ 70% ของพูล' })
+                    .setTimestamp()],
+                ephemeral: true,
+            });
+        }
+
         if (customId === 'modal_stock_buy') {
             const ud = getUser(user.id); const stocks = loadStocks();
             const sym = interaction.fields.getTextInputValue('symbol').trim().toUpperCase();
@@ -1378,28 +1683,54 @@ async function handleHire(interaction, targetUser, role) {
     const user = interaction.user;
     const ud = getUser(user.id);
     if (!ud.shop) return interaction.reply({ content: '❌ ยังไม่มีร้านค้า!', ephemeral: true });
-    if (!ud.kitchenChannelId) return interaction.reply({ content: '❌ ยังไม่มีห้องครัว!', ephemeral: true });
-    if (targetUser.id === user.id) return interaction.reply({ content: '❌ ไม่สามารถจ้างตัวเองได้!', ephemeral: true });
-    if (targetUser.bot) return interaction.reply({ content: '❌ ไม่สามารถจ้างบอทได้!', ephemeral: true });
+    if (targetUser.id === user.id) return interaction.reply({ content: '❌ ไม่สามารถเสนองานให้ตัวเองได้!', ephemeral: true });
+    if (targetUser.bot) return interaction.reply({ content: '❌ ไม่สามารถเสนองานให้บอทได้!', ephemeral: true });
 
     const staff = ud.shopStaff || [];
-    if (staff.find(s => s.id === targetUser.id)) return interaction.reply({ content: `❌ **${targetUser.username}** เป็นพนักงานอยู่แล้ว!`, ephemeral: true });
+    if (staff.find(s => s.id === targetUser.id))
+        return interaction.reply({ content: `❌ **${targetUser.username}** เป็นพนักงานร้านนี้อยู่แล้ว!`, ephemeral: true });
 
-    const targetData = getUser(targetUser.id);
-    staff.push({ id: targetUser.id, name: targetData.charName || targetUser.username, role, hiredAt: Date.now() });
-    updateUser(user.id, { shopStaff: staff });
+    const offerId = `${user.id}_${targetUser.id}`;
+    if (pendingJobOffers.has(offerId))
+        return interaction.reply({ content: `⏳ รอ **${targetUser.username}** ตอบรับคำเชิญก่อนหน้าอยู่!`, ephemeral: true });
+
+    // เก็บ offer ไว้ในหน่วยความจำ (หมดเมื่อบอทรีสตาร์ท)
+    pendingJobOffers.set(offerId, { ownerId: user.id, targetId: targetUser.id, role, shopName: ud.shop, sentAt: Date.now() });
+
+    // ส่ง DM ถาม
+    const offerEmbed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle('📩 คุณได้รับการเสนองาน!')
+        .setDescription(`**${ud.charName || user.username}** ต้องการชวนคุณทำงาน`)
+        .addFields(
+            { name: '🏪 ร้านค้า', value: ud.shop, inline: true },
+            { name: '👔 ตำแหน่ง', value: role, inline: true },
+        )
+        .setFooter({ text: 'คำเชิญหมดอายุเมื่อบอทรีสตาร์ท' })
+        .setTimestamp();
+
+    const offerRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`job_accept:${offerId}`).setLabel('✅ รับงาน').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`job_decline:${offerId}`).setLabel('❌ ปฏิเสธ').setStyle(ButtonStyle.Danger),
+    );
 
     try {
-        const kitchen = await client.channels.fetch(ud.kitchenChannelId);
-        await kitchen.permissionOverwrites.edit(targetUser.id, { [PermissionFlagsBits.ViewChannel]: true, [PermissionFlagsBits.SendMessages]: true, [PermissionFlagsBits.ReadMessageHistory]: true });
-        await kitchen.send({ embeds: [new EmbedBuilder().setColor(0x00cc66).setDescription(`👋 ยินดีต้อนรับ <@${targetUser.id}> ในฐานะ **${role}**!`).setTimestamp()] });
-    } catch {}
+        await targetUser.send({ embeds: [offerEmbed], components: [offerRow] });
+    } catch {
+        pendingJobOffers.delete(offerId);
+        return interaction.reply({ content: `❌ ไม่สามารถส่ง DM ให้ **${targetUser.username}** ได้\nอาจปิด DM ไว้อยู่`, ephemeral: true });
+    }
 
-    try { await targetUser.send({ embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('🎉 ได้รับการจ้างงาน!').setDescription(`คุณได้รับการรับเข้าทำงานที่ร้าน **${ud.shop}**`).addFields({ name: '👔 ตำแหน่ง', value: role, inline: true }, { name: '🏪 ร้านค้า', value: ud.shop, inline: true }).setTimestamp()] }); } catch {}
-
-    await interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('✅ รับพนักงานสำเร็จ!').addFields({ name: '👤 พนักงานใหม่', value: `<@${targetUser.id}>`, inline: true }, { name: '👔 ตำแหน่ง', value: role, inline: true }, { name: '👥 รวม', value: `${staff.length} คน`, inline: true }).setTimestamp()], ephemeral: true });
-
-    if (interaction.message) return interaction.message.edit(buildStaffPanel(user.id));
+    await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('📨 ส่งคำเชิญแล้ว!')
+            .setDescription(`ส่ง DM ไปหา <@${targetUser.id}> เรียบร้อยแล้ว\nรอการตอบรับ...`)
+            .addFields(
+                { name: '🏪 ร้าน', value: ud.shop, inline: true },
+                { name: '👔 ตำแหน่ง', value: role, inline: true },
+            )
+            .setTimestamp()],
+        ephemeral: true,
+    });
 }
 
 async function handleFire(interaction, targetUser) {
