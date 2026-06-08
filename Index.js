@@ -12,10 +12,19 @@ const QRCode = require('qrcode');
 const Jimp = require('jimp');
 const jsQR = require('jsqr');
 
+const crypto = require('crypto');
+
 const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+// Session จะหมดเมื่อบอทรีสตาร์ท
+const activeSessions = new Set();
+
+function hashPassword(pw) {
+    return crypto.createHash('sha256').update(pw + 'econ_salt_2025').digest('hex');
+}
 
 const DATA_FILE = './data.json';
 const CONFIG_FILE = './config.json';
@@ -61,9 +70,14 @@ function updateUser(userId, updates) {
 }
 
 function requireLogin(interaction) {
-    const u = getUser(interaction.user.id);
-    if (!u.loggedIn) {
-        interaction.reply({ embeds: [new EmbedBuilder().setColor(0xff0000).setTitle('❌ ยังไม่ได้เข้าสู่ระบบ').setDescription('กรุณาใช้ `/panel` → **สร้างตัวละคร** ก่อนใช้งาน')], ephemeral: true });
+    const uid = interaction.user.id;
+    const u = getUser(uid);
+    if (!u.loggedIn || !activeSessions.has(uid)) {
+        interaction.reply({
+            embeds: [new EmbedBuilder().setColor(0xff0000).setTitle('❌ ยังไม่ได้เข้าสู่ระบบ')
+                .setDescription(u.loggedIn ? 'Session หมดอายุแล้ว กรุณากด `/panel` → **🔐 เข้าสู่ระบบ** อีกครั้ง' : 'กรุณาใช้ `/panel` → **📝 สมัครสมาชิก** ก่อนใช้งาน')],
+            ephemeral: true,
+        });
         return false;
     }
     return true;
@@ -274,18 +288,28 @@ function buildMainPanel(userId) {
 function buildCharacterPanel(userId) {
     const ud = getUser(userId);
     const job = ud.jobKey ? JOBS[ud.jobKey] : null;
+    const hasAccount = ud.loggedIn; // มีบัญชีในระบบแล้ว
+    const hasSession = activeSessions.has(userId); // session ใช้งานอยู่
+
+    let statusText;
+    if (!hasAccount) {
+        statusText = '❌ ยังไม่มีบัญชี — กด **📝 สมัครสมาชิก** เพื่อสร้างตัวละคร';
+    } else if (!hasSession) {
+        statusText = `🔒 มีบัญชีแล้วในชื่อ **${ud.charName}** — กด **🔐 เข้าสู่ระบบ** และกรอกรหัสผ่าน`;
+    } else {
+        statusText = `✅ เข้าสู่ระบบอยู่\n🪪 **${ud.charName}** | ${job ? `${job.emoji} ${job.name}` : '-'}\n💵 ${ud.balance.toLocaleString()} บาท`;
+    }
 
     const embed = new EmbedBuilder()
-        .setColor(0x5865f2)
+        .setColor(hasSession ? 0x00cc66 : hasAccount ? 0xffcc00 : 0xed4245)
         .setTitle('👤 Panel — ตัวละคร & โปรไฟล์')
-        .setDescription(ud.loggedIn
-            ? `✅ เข้าสู่ระบบแล้ว\n🪪 **${ud.charName}** | ${job ? `${job.emoji} ${job.name}` : '-'}`
-            : '❌ ยังไม่ได้สร้างตัวละคร')
+        .setDescription(statusText)
         .setTimestamp();
 
     const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('action_login').setLabel('🆕 สร้างตัวละคร').setStyle(ButtonStyle.Success).setDisabled(ud.loggedIn),
-        new ButtonBuilder().setCustomId('action_profile').setLabel('👤 ดูโปรไฟล์').setStyle(ButtonStyle.Primary).setDisabled(!ud.loggedIn),
+        new ButtonBuilder().setCustomId('action_register').setLabel('📝 สมัครสมาชิก').setStyle(ButtonStyle.Success).setDisabled(hasAccount),
+        new ButtonBuilder().setCustomId('action_login').setLabel('🔐 เข้าสู่ระบบ').setStyle(ButtonStyle.Primary).setDisabled(!hasAccount || hasSession),
+        new ButtonBuilder().setCustomId('action_profile').setLabel('👤 ดูโปรไฟล์').setStyle(ButtonStyle.Secondary).setDisabled(!hasSession),
         new ButtonBuilder().setCustomId('panel_main').setLabel('↩ กลับ').setStyle(ButtonStyle.Secondary),
     );
 
@@ -341,7 +365,6 @@ function buildShopPanel(userId) {
         new ButtonBuilder().setCustomId('action_newshop').setLabel('🏗️ สร้างร้าน').setStyle(ButtonStyle.Success).setDisabled(hasShop),
         new ButtonBuilder().setCustomId('action_openshop').setLabel('🟢 เปิดร้าน').setStyle(ButtonStyle.Success).setDisabled(!hasShop || !!ud.shopOpen),
         new ButtonBuilder().setCustomId('action_closeshop').setLabel('🔴 ปิดร้าน').setStyle(ButtonStyle.Danger).setDisabled(!hasShop || !ud.shopOpen),
-        new ButtonBuilder().setCustomId('action_shoplist').setLabel('🗺️ ดูร้านทั้งหมด').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('panel_main').setLabel('↩ กลับ').setStyle(ButtonStyle.Secondary),
     );
 
@@ -507,25 +530,19 @@ client.on('interactionCreate', async interaction => {
         // ── /login ────────────────────────────────────────────────────────────
         if (commandName === 'login') {
             const ud = getUser(user.id);
+
+            // มีบัญชีแล้ว — เช็ครหัสผ่าน
             if (ud.loggedIn) {
-                const j = JOBS[ud.jobKey] || JOBS.farmer;
-                return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('✅ เข้าสู่ระบบแล้ว').setDescription(`ยินดีต้อนรับกลับ **${ud.charName}**!\n${j.emoji} ${j.name} | 💵 ${ud.balance.toLocaleString()} บาท`)], ephemeral: true });
+                if (activeSessions.has(user.id)) {
+                    const j = JOBS[ud.jobKey] || JOBS.farmer;
+                    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('✅ เข้าสู่ระบบอยู่แล้ว').setDescription(`ยินดีต้อนรับ **${ud.charName}**!\n${j.emoji} ${j.name} | 💵 ${ud.balance.toLocaleString()} บาท`)], ephemeral: true });
+                }
+                // มีบัญชีแต่ไม่มี session → ให้แนะนำไปใช้ /panel
+                return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('🔐 กรุณา Login ผ่าน Panel').setDescription(`คุณมีบัญชีชื่อ **${ud.charName}** อยู่แล้ว\nใช้ \`/panel\` → **🔐 เข้าสู่ระบบ** เพื่อกรอกรหัสผ่าน`)], ephemeral: true });
             }
-            const charName = interaction.options.getString('charname');
-            const jobKey = interaction.options.getString('job');
-            const job = JOBS[jobKey];
-            updateUser(user.id, { loggedIn: true, balance: job.start, charName, jobKey });
-            return interaction.reply({
-                embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('🎉 สร้างตัวละครสำเร็จ!')
-                    .setThumbnail(user.displayAvatarURL({ size: 256 }))
-                    .setDescription(`ยินดีต้อนรับ **${charName}**! 🌏`)
-                    .addFields(
-                        { name: `${job.emoji} อาชีพ`, value: job.name, inline: true },
-                        { name: '📋 รายละเอียด', value: job.desc, inline: true },
-                        { name: '💵 รายได้/ครั้ง', value: `${job.min}–${job.max} บาท`, inline: true },
-                        { name: '💰 เงินตั้งต้น', value: `${job.start} บาท`, inline: true },
-                    ).setFooter({ text: 'ใช้ /panel เพื่อดูระบบทั้งหมด' }).setTimestamp()],
-            });
+
+            // ยังไม่มีบัญชี → สมัคร (ไม่มี password option ใน slash ให้ใช้ /panel แทน)
+            return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📝 สมัครสมาชิกผ่าน Panel').setDescription('ใช้คำสั่ง `/panel` → **👤 ตัวละคร** → **📝 สมัครสมาชิก**\nเพื่อกรอกชื่อ, อาชีพ และตั้งรหัสผ่านได้เลย!')], ephemeral: true });
         }
 
         // ── /balance ──────────────────────────────────────────────────────────
@@ -858,11 +875,23 @@ client.on('interactionCreate', async interaction => {
         }
 
         // ── Actions (open modals) ─────────────────────────────────────────────
+        if (customId === 'action_register') {
+            const modal = new ModalBuilder().setCustomId('modal_register').setTitle('📝 สมัครสมาชิก');
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('charname').setLabel('ชื่อตัวละคร').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(30).setPlaceholder('เช่น นายโปรแกรมเมอร์')),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('job').setLabel('อาชีพ: chef / builder / driver / programmer / delivery / farmer / trader / doctor').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น farmer')),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('password').setLabel('ตั้งรหัสผ่าน (จำไว้ด้วย!)').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(4).setMaxLength(30).setPlaceholder('รหัสผ่านของคุณ')),
+            );
+            return interaction.showModal(modal);
+        }
+
         if (customId === 'action_login') {
-            const modal = new ModalBuilder().setCustomId('modal_login').setTitle('🎮 สร้างตัวละคร');
-            const charNameInput = new TextInputBuilder().setCustomId('charname').setLabel('ชื่อตัวละครของคุณ').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(30).setPlaceholder('เช่น นายโปรแกรมเมอร์');
-            const jobInput = new TextInputBuilder().setCustomId('job').setLabel('อาชีพ (พิมพ์คีย์: chef/builder/driver/programmer/delivery/farmer/trader/doctor)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น farmer หรือ chef');
-            modal.addComponents(new ActionRowBuilder().addComponents(charNameInput), new ActionRowBuilder().addComponents(jobInput));
+            const ud = getUser(user.id);
+            if (!ud.loggedIn) return interaction.update(buildCharacterPanel(user.id));
+            const modal = new ModalBuilder().setCustomId('modal_login').setTitle('🔐 เข้าสู่ระบบ');
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('password').setLabel(`กรอกรหัสผ่านของ ${ud.charName}`).setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('รหัสผ่านของคุณ')),
+            );
             return interaction.showModal(modal);
         }
 
@@ -1055,17 +1084,72 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isModalSubmit()) {
         const { customId, user } = interaction;
 
-        // ── Login ─────────────────────────────────────────────────────────────
-        if (customId === 'modal_login') {
+        // ── Register (สมัครสมาชิกครั้งแรก) ──────────────────────────────────────
+        if (customId === 'modal_register') {
             const ud = getUser(user.id);
-            if (ud.loggedIn) return interaction.reply({ content: '❌ คุณสร้างตัวละครแล้ว!', ephemeral: true });
+            if (ud.loggedIn) return interaction.reply({ content: '❌ คุณมีบัญชีแล้ว! ใช้ปุ่ม **🔐 เข้าสู่ระบบ** แทน', ephemeral: true });
             const charName = interaction.fields.getTextInputValue('charname').trim();
             const jobKey = interaction.fields.getTextInputValue('job').trim().toLowerCase();
+            const password = interaction.fields.getTextInputValue('password');
             if (!JOBS[jobKey]) return interaction.reply({ content: `❌ อาชีพ "${jobKey}" ไม่ถูกต้อง!\nใช้: chef, builder, driver, programmer, delivery, farmer, trader, doctor`, ephemeral: true });
             const job = JOBS[jobKey];
-            updateUser(user.id, { loggedIn: true, balance: job.start, charName, jobKey });
-            await interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('🎉 สร้างตัวละครสำเร็จ!').setThumbnail(user.displayAvatarURL({ size: 256 })).setDescription(`ยินดีต้อนรับ **${charName}**! 🌏`).addFields({ name: `${job.emoji} อาชีพ`, value: job.name, inline: true }, { name: '💵 รายได้', value: `${job.min}–${job.max} บาท`, inline: true }, { name: '💰 เงินตั้งต้น', value: `${job.start} บาท`, inline: true }).setTimestamp()], ephemeral: true });
+            updateUser(user.id, { loggedIn: true, balance: job.start, charName, jobKey, passwordHash: hashPassword(password) });
+            activeSessions.add(user.id);
+            await interaction.reply({
+                embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('🎉 สมัครสมาชิกสำเร็จ!')
+                    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+                    .setDescription(`ยินดีต้อนรับ **${charName}**! 🌏\n✅ เข้าสู่ระบบแล้วอัตโนมัติ`)
+                    .addFields(
+                        { name: `${job.emoji} อาชีพ`, value: job.name, inline: true },
+                        { name: '💵 รายได้/ครั้ง', value: `${job.min}–${job.max} บาท`, inline: true },
+                        { name: '💰 เงินตั้งต้น', value: `${job.start} บาท`, inline: true },
+                        { name: '🔐 รหัสผ่าน', value: 'บันทึกแล้ว — ใช้เข้าสู่ระบบครั้งต่อไป', inline: false },
+                    )
+                    .setFooter({ text: 'Session หมดเมื่อบอทรีสตาร์ท — login ใหม่ได้ที่ /panel' })
+                    .setTimestamp()],
+                ephemeral: true,
+            });
             return;
+        }
+
+        // ── Login (กรอกรหัสผ่าน) ──────────────────────────────────────────────
+        if (customId === 'modal_login') {
+            const ud = getUser(user.id);
+            if (!ud.loggedIn) return interaction.reply({ content: '❌ ยังไม่มีบัญชี! กด **📝 สมัครสมาชิก** ก่อน', ephemeral: true });
+            if (activeSessions.has(user.id)) return interaction.reply({ content: '✅ เข้าสู่ระบบอยู่แล้ว!', ephemeral: true });
+
+            const password = interaction.fields.getTextInputValue('password');
+            if (!ud.passwordHash) {
+                // บัญชีเก่าที่ยังไม่มีรหัส — ตั้งรหัสใหม่ได้เลย
+                updateUser(user.id, { passwordHash: hashPassword(password) });
+                activeSessions.add(user.id);
+                return interaction.reply({
+                    embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('🔐 ตั้งรหัสผ่านและเข้าสู่ระบบสำเร็จ!')
+                        .setDescription(`ยินดีต้อนรับกลับ **${ud.charName}**!\nรหัสผ่านถูกตั้งค่าเรียบร้อยแล้ว`)
+                        .setTimestamp()],
+                    ephemeral: true,
+                });
+            }
+
+            if (hashPassword(password) !== ud.passwordHash) {
+                return interaction.reply({ content: '❌ รหัสผ่านไม่ถูกต้อง! ลองใหม่อีกครั้ง', ephemeral: true });
+            }
+
+            activeSessions.add(user.id);
+            const job = JOBS[ud.jobKey];
+            return interaction.reply({
+                embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('✅ เข้าสู่ระบบสำเร็จ!')
+                    .setThumbnail(user.displayAvatarURL({ size: 128 }))
+                    .setDescription(`ยินดีต้อนรับกลับ **${ud.charName}**! 👋`)
+                    .addFields(
+                        { name: `${job ? job.emoji : '💼'} อาชีพ`, value: job ? job.name : '-', inline: true },
+                        { name: '💵 กระเป๋า', value: `${ud.balance.toLocaleString()} บาท`, inline: true },
+                        { name: '🏦 ธนาคาร', value: `${ud.deposited.toLocaleString()} บาท`, inline: true },
+                    )
+                    .setFooter({ text: 'Session จะหมดเมื่อบอทรีสตาร์ท' })
+                    .setTimestamp()],
+                ephemeral: true,
+            });
         }
 
         // ── Finance ───────────────────────────────────────────────────────────
