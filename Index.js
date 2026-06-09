@@ -32,6 +32,9 @@ function hashPassword(pw) {
 }
 
 function isSessionActive(userId) {
+    const ud = getUser(userId);
+    // ถ้าผู้ใช้ปิด session timeout → ถือว่า active ตลอดถ้ามีบัญชี
+    if (ud.noSessionTimeout && ud.loggedIn) return true;
     if (!activeSessions.has(userId)) return false;
     const lastActive = activeSessions.get(userId);
     if (Date.now() - lastActive > SESSION_TIMEOUT) {
@@ -109,6 +112,7 @@ async function runLotteryDraw() {
         for (const w of winners) {
             const ud = getUser(w.userId);
             updateUser(w.userId, { balance: ud.balance + share });
+            addInbox(w.userId, '🎰', `ถูกรางวัลลอตเตอรี่! เลข **${drawnNumber}** ได้รับ **${share.toLocaleString()} บาท**`);
         }
         lottery.lastResult = { drawn: drawnNumber, winners: winners.map(w => ({ userId: w.userId, charName: w.charName })), prize: share };
         lottery.pool = 0;
@@ -168,6 +172,37 @@ async function trySetNickname(interaction, charName) {
             await interaction.member.setNickname(charName);
         }
     } catch { /* บอทไม่มีสิทธิ์ หรือเป็น server owner — ข้ามได้ */ }
+}
+
+// เพิ่มข้อความในกล่องขาเข้าของผู้ใช้ (สูงสุด 30 ข้อความ)
+function addInbox(userId, icon, text) {
+    const d = loadData();
+    if (!d[userId]) return;
+    if (!d[userId].inbox) d[userId].inbox = [];
+    d[userId].inbox.unshift({ icon, text, time: Date.now() });
+    if (d[userId].inbox.length > 30) d[userId].inbox = d[userId].inbox.slice(0, 30);
+    saveData(d);
+}
+
+// ตรวจสอบ PIN ในธุรกรรม — คืน false แล้ว reply ถ้าไม่ผ่าน
+function checkPIN(interaction, ud) {
+    if (!ud.pinHash) return true;
+    let pinRaw = '';
+    try { pinRaw = interaction.fields.getTextInputValue('pin_verify').trim(); } catch { return true; }
+    if (hashPassword(pinRaw) !== ud.pinHash) {
+        interaction.reply({ content: '❌ PIN ไม่ถูกต้อง! ธุรกรรมถูกยกเลิก', ephemeral: true });
+        return false;
+    }
+    return true;
+}
+
+// เพิ่ม field PIN ในกรณีที่ user ตั้ง PIN ไว้
+function addPinFieldIfNeeded(modal, ud) {
+    if (ud.pinHash) {
+        modal.addComponents(new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('pin_verify').setLabel('🔢 ยืนยัน PIN').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(4).setMaxLength(6).setPlaceholder('กรอก PIN เพื่อยืนยันธุรกรรม')
+        ));
+    }
 }
 
 function requireLogin(interaction) {
@@ -370,6 +405,7 @@ function buildMainPanel(userId) {
             { name: '📊 หุ้น', value: 'ซื้อ/ขายหุ้น, พอร์ต', inline: true },
             { name: '📲 QR', value: 'สร้าง/สแกน QR', inline: true },
             { name: '🎰 ลอตเตอรี่', value: 'ซื้อสลาก, ดูผล', inline: true },
+            { name: '⚙️ ตั้งค่า', value: 'PIN, Bio, สี Embed, Session', inline: true },
         )
         .setFooter({ text: 'กดปุ่มด้านล่างเพื่อเข้าระบบที่ต้องการ' })
         .setTimestamp();
@@ -390,6 +426,8 @@ function buildMainPanel(userId) {
     );
     const row3 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('panel_lottery').setLabel('🎰 ลอตเตอรี่รายวัน').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('panel_settings').setLabel('⚙️ ตั้งค่า').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('panel_inbox').setLabel('📬 กล่องขาเข้า').setStyle(ButtonStyle.Primary),
     );
 
     return { embeds: [embed], components: [row1, row2, row3], ephemeral: true };
@@ -658,6 +696,71 @@ function buildLotteryPanel(userId) {
 
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('action_lottery_buy').setLabel('🎟️ ซื้อสลาก 100 บาท').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('panel_main').setLabel('↩ กลับ').setStyle(ButtonStyle.Secondary),
+    );
+
+    return { embeds: [embed], components: [row], ephemeral: true };
+}
+
+function buildSettingsPanel(userId) {
+    const ud = getUser(userId);
+    const hasPIN       = !!ud.pinHash;
+    const hasBio       = !!ud.bio;
+    const embedColor   = ud.embedColor || null;
+    const noTimeout    = !!ud.noSessionTimeout;
+
+    const embed = new EmbedBuilder()
+        .setColor(embedColor || 0x5865f2)
+        .setTitle('⚙️ Panel — ตั้งค่าบัญชี')
+        .setDescription(ud.loggedIn ? `**${ud.charName}** — จัดการการตั้งค่าบัญชีของคุณ` : '⚠️ กรุณาเข้าสู่ระบบก่อน')
+        .addFields(
+            { name: '🔢 PIN', value: hasPIN ? '🟢 ตั้งค่าแล้ว' : '🔴 ยังไม่ได้ตั้ง', inline: true },
+            { name: '📝 Bio', value: hasBio ? `"${ud.bio.slice(0, 40)}${ud.bio.length > 40 ? '…' : ''}"` : '(ว่าง)', inline: true },
+            { name: '🎨 Embed Color', value: embedColor ? `#${embedColor.toString(16).padStart(6, '0').toUpperCase()}` : '(ค่าเริ่มต้น)', inline: true },
+            { name: '⏱️ Session Timeout', value: noTimeout ? '🔕 **ปิด** — ไม่ต้อง login ซ้ำ' : '🔔 **เปิด** — หมดอายุทุก 5 นาที', inline: false },
+        )
+        .setFooter({ text: 'PIN ใช้ยืนยันธุรกรรมสำคัญ | Bio แสดงในโปรไฟล์' })
+        .setTimestamp();
+
+    const row1 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('action_set_pin').setLabel('🔢 ตั้ง PIN').setStyle(ButtonStyle.Primary).setDisabled(!ud.loggedIn),
+        new ButtonBuilder().setCustomId('action_set_bio').setLabel('📝 ตั้ง Bio').setStyle(ButtonStyle.Primary).setDisabled(!ud.loggedIn),
+        new ButtonBuilder().setCustomId('action_set_embed').setLabel('🎨 ตั้งสี Embed').setStyle(ButtonStyle.Primary).setDisabled(!ud.loggedIn),
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('action_toggle_session')
+            .setLabel(noTimeout ? '🔔 เปิด Session Timeout' : '🔕 ปิด Session Timeout')
+            .setStyle(noTimeout ? ButtonStyle.Success : ButtonStyle.Danger)
+            .setDisabled(!ud.loggedIn),
+        new ButtonBuilder().setCustomId('panel_main').setLabel('↩ กลับ').setStyle(ButtonStyle.Secondary),
+    );
+
+    return { embeds: [embed], components: [row1, row2], ephemeral: true };
+}
+
+function buildInboxPanel(userId) {
+    const ud = getUser(userId);
+    const msgs = ud.inbox || [];
+
+    const embed = new EmbedBuilder()
+        .setColor(ud.embedColor || 0x5865f2)
+        .setTitle('📬 กล่องขาเข้า')
+        .setDescription(msgs.length
+            ? msgs.map((m, i) => {
+                const ago = Date.now() - m.time;
+                const mins = Math.floor(ago / 60_000);
+                const hrs  = Math.floor(ago / 3_600_000);
+                const days = Math.floor(ago / 86_400_000);
+                const timeStr = days > 0 ? `${days}ว` : hrs > 0 ? `${hrs}ชม` : mins > 0 ? `${mins}น` : 'เมื่อกี้';
+                return `${m.icon} **[${timeStr}]** ${m.text}`;
+              }).join('\n')
+            : '📭 ไม่มีข้อความ')
+        .setFooter({ text: `${msgs.length}/30 ข้อความ` })
+        .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('action_inbox_clear').setLabel('🗑️ ล้างทั้งหมด').setStyle(ButtonStyle.Danger).setDisabled(!msgs.length),
         new ButtonBuilder().setCustomId('panel_main').setLabel('↩ กลับ').setStyle(ButtonStyle.Secondary),
     );
 
@@ -1047,6 +1150,16 @@ client.on('interactionCreate', async interaction => {
             if (!getUser(user.id).loggedIn) return interaction.update(buildCharacterPanel(user.id));
             return interaction.update(buildQRPanel(user.id));
         }
+        if (customId === 'panel_settings') {
+            return interaction.update(buildSettingsPanel(user.id));
+        }
+        if (customId === 'panel_inbox') {
+            return interaction.update(buildInboxPanel(user.id));
+        }
+        if (customId === 'action_inbox_clear') {
+            updateUser(user.id, { inbox: [] });
+            return interaction.update(buildInboxPanel(user.id));
+        }
 
         // ── Actions (open modals) ─────────────────────────────────────────────
         if (customId === 'action_lottery_buy') {
@@ -1056,6 +1169,7 @@ client.on('interactionCreate', async interaction => {
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('number').setLabel('เลือกเลข 1–99').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(1).setMaxLength(2).setPlaceholder('เช่น 7 หรือ 42')),
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('qty').setLabel('จำนวนใบ (1–10 ใบ) ราคา 100 บาท/ใบ').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(1).setMaxLength(2).setPlaceholder('เช่น 1')),
             );
+            addPinFieldIfNeeded(modal, getUser(user.id));
             return interaction.showModal(modal);
         }
 
@@ -1098,23 +1212,29 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (customId === 'action_deposit') {
+            const ud = getUser(user.id);
             const modal = new ModalBuilder().setCustomId('modal_deposit').setTitle('🏦 ฝากเงิน');
-            modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel(`จำนวนเงินที่ฝาก (มีในกระเป๋า: ${getUser(user.id).balance.toLocaleString()} บาท)`).setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น 500')));
+            modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel(`จำนวนเงินที่ฝาก (มีในกระเป๋า: ${ud.balance.toLocaleString()} บาท)`).setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น 500')));
+            addPinFieldIfNeeded(modal, ud);
             return interaction.showModal(modal);
         }
 
         if (customId === 'action_withdraw') {
+            const ud = getUser(user.id);
             const modal = new ModalBuilder().setCustomId('modal_withdraw').setTitle('💸 ถอนเงิน');
-            modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel(`จำนวนเงินที่ถอน (ธนาคาร: ${getUser(user.id).deposited.toLocaleString()} บาท)`).setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น 500')));
+            modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel(`จำนวนเงินที่ถอน (ธนาคาร: ${ud.deposited.toLocaleString()} บาท)`).setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น 500')));
+            addPinFieldIfNeeded(modal, ud);
             return interaction.showModal(modal);
         }
 
         if (customId === 'action_give') {
+            const ud = getUser(user.id);
             const modal = new ModalBuilder().setCustomId('modal_give').setTitle('🤝 โอนเงิน');
             modal.addComponents(
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('user_id').setLabel('Discord ID ของผู้รับ (คลิกขวา → Copy ID)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น 123456789012345678')),
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('จำนวนเงิน (บาท)').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น 200')),
             );
+            addPinFieldIfNeeded(modal, ud);
             return interaction.showModal(modal);
         }
 
@@ -1223,6 +1343,7 @@ client.on('interactionCreate', async interaction => {
 
             if (!isAccept) {
                 // ── ปฏิเสธ ──
+                addInbox(offer.ownerId, '❌', `**${getUser(offer.targetId).charName || 'ไม่ทราบ'}** ปฏิเสธตำแหน่ง **${offer.role}** ที่ร้าน **${offer.shopName}**`);
                 await interaction.update({
                     embeds: [new EmbedBuilder().setColor(0xed4245).setTitle('❌ ปฏิเสธงานแล้ว').setDescription(`คุณปฏิเสธตำแหน่ง **${offer.role}** ที่ร้าน **${offer.shopName}**`)],
                     components: [],
@@ -1260,7 +1381,10 @@ client.on('interactionCreate', async interaction => {
                 components: [],
             });
 
-            // แจ้งเจ้าของร้าน
+            // inbox: ผู้รับงาน
+            addInbox(offer.targetId, '✅', `รับตำแหน่ง **${offer.role}** ที่ร้าน **${offer.shopName}** แล้ว`);
+            // inbox + DM: เจ้าของร้าน
+            addInbox(offer.ownerId, '🎉', `**${targetData.charName || 'ไม่ทราบ'}** รับตำแหน่ง **${offer.role}** ที่ร้านของคุณแล้ว`);
             try {
                 const owner = await client.users.fetch(offer.ownerId);
                 await owner.send({ embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('🎉 มีพนักงานใหม่!').setDescription(`<@${offer.targetId}> รับตำแหน่ง **${offer.role}** ที่ร้าน **${offer.shopName}** แล้ว`).addFields({ name: '👥 พนักงานรวม', value: `${staff.length} คน`, inline: true }).setTimestamp()] });
@@ -1287,20 +1411,24 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (customId === 'action_stock_buy') {
+            const ud = getUser(user.id);
             const modal = new ModalBuilder().setCustomId('modal_stock_buy').setTitle('📈 ซื้อหุ้น');
             modal.addComponents(
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('symbol').setLabel('ชื่อย่อหุ้น').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('SKBD / BREAD / GOLD / DBANK / FARM / TECH')),
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('จำนวนหุ้น').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น 10')),
             );
+            addPinFieldIfNeeded(modal, ud);
             return interaction.showModal(modal);
         }
 
         if (customId === 'action_stock_sell') {
+            const ud = getUser(user.id);
             const modal = new ModalBuilder().setCustomId('modal_stock_sell').setTitle('📉 ขายหุ้น');
             modal.addComponents(
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('symbol').setLabel('ชื่อย่อหุ้น').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('SKBD / BREAD / GOLD / DBANK / FARM / TECH')),
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('จำนวนหุ้น').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('เช่น 10')),
             );
+            addPinFieldIfNeeded(modal, ud);
             return interaction.showModal(modal);
         }
 
@@ -1325,6 +1453,50 @@ client.on('interactionCreate', async interaction => {
             await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x0099ff).setTitle('📲 QR Code ของคุณ').setDescription('ให้คนอื่นสแกนเพื่อโอนเงินให้คุณ').addFields({ name: '💵 ยอดเงิน', value: `${ud.balance.toLocaleString()} บาท`, inline: true }).setImage('attachment://qrcode.png').setTimestamp()], files: [att] });
             setTimeout(() => { try { fs.unlinkSync(qrPath); } catch {} }, 10000);
             return;
+        }
+
+        // ── Settings actions ──────────────────────────────────────────────────
+        if (customId === 'action_set_pin') {
+            if (!requireLogin(interaction)) return;
+            const ud = getUser(user.id);
+            const modal = new ModalBuilder().setCustomId('modal_set_pin').setTitle('🔢 ตั้ง PIN');
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('pin').setLabel('PIN ใหม่ (4–6 ตัวเลข)').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(4).setMaxLength(6).setPlaceholder('เช่น 1234')),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('confirm_pin').setLabel('ยืนยัน PIN อีกครั้ง').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(4).setMaxLength(6).setPlaceholder('กรอก PIN เดิมซ้ำ')),
+            );
+            if (ud.pinHash) {
+                modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('old_pin').setLabel('PIN เดิม (ใส่เพื่อยืนยัน)').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(4).setMaxLength(6).setPlaceholder('PIN ปัจจุบันของคุณ')));
+            }
+            return interaction.showModal(modal);
+        }
+
+        if (customId === 'action_set_bio') {
+            if (!requireLogin(interaction)) return;
+            const ud = getUser(user.id);
+            const modal = new ModalBuilder().setCustomId('modal_set_bio').setTitle('📝 ตั้ง Bio');
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bio').setLabel('Bio ของคุณ').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(150).setPlaceholder('แนะนำตัวเอง, อาชีพ, หรืออะไรก็ได้...\n(เว้นว่างเพื่อล้าง Bio)').setValue(ud.bio || '')),
+            );
+            return interaction.showModal(modal);
+        }
+
+        if (customId === 'action_set_embed') {
+            if (!requireLogin(interaction)) return;
+            const ud = getUser(user.id);
+            const currentHex = ud.embedColor ? `#${ud.embedColor.toString(16).padStart(6, '0').toUpperCase()}` : '';
+            const modal = new ModalBuilder().setCustomId('modal_set_embed').setTitle('🎨 ตั้งสี Embed');
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('color').setLabel('สี Hex (เช่น #FF5733 หรือ FF5733)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(7).setPlaceholder('เว้นว่างเพื่อใช้สีเริ่มต้น').setValue(currentHex)),
+            );
+            return interaction.showModal(modal);
+        }
+
+        if (customId === 'action_toggle_session') {
+            if (!requireLogin(interaction)) return;
+            const ud = getUser(user.id);
+            const newVal = !ud.noSessionTimeout;
+            updateUser(user.id, { noSessionTimeout: newVal });
+            return interaction.update(buildSettingsPanel(user.id));
         }
     }
 
@@ -1409,6 +1581,7 @@ client.on('interactionCreate', async interaction => {
         // ── Finance ───────────────────────────────────────────────────────────
         if (customId === 'modal_deposit') {
             const ud = getUser(user.id);
+            if (!checkPIN(interaction, ud)) return;
             const amount = parseInt(interaction.fields.getTextInputValue('amount'));
             if (isNaN(amount) || amount < 1) return interaction.reply({ content: '❌ จำนวนไม่ถูกต้อง!', ephemeral: true });
             if (ud.balance < amount) return interaction.reply({ content: `❌ เงินไม่พอ! มีแค่ ${ud.balance.toLocaleString()} บาท`, ephemeral: true });
@@ -1419,6 +1592,7 @@ client.on('interactionCreate', async interaction => {
 
         if (customId === 'modal_withdraw') {
             const ud = getUser(user.id);
+            if (!checkPIN(interaction, ud)) return;
             const amount = parseInt(interaction.fields.getTextInputValue('amount'));
             if (isNaN(amount) || amount < 1) return interaction.reply({ content: '❌ จำนวนไม่ถูกต้อง!', ephemeral: true });
             if (ud.deposited < amount) return interaction.reply({ content: `❌ เงินในธนาคารไม่พอ! มีแค่ ${ud.deposited.toLocaleString()} บาท`, ephemeral: true });
@@ -1429,6 +1603,7 @@ client.on('interactionCreate', async interaction => {
 
         if (customId === 'modal_give') {
             const ud = getUser(user.id);
+            if (!checkPIN(interaction, ud)) return;
             const receiverId = interaction.fields.getTextInputValue('user_id').trim();
             const amount = parseInt(interaction.fields.getTextInputValue('amount'));
             if (isNaN(amount) || amount < 1) return interaction.reply({ content: '❌ จำนวนไม่ถูกต้อง!', ephemeral: true });
@@ -1437,6 +1612,7 @@ client.on('interactionCreate', async interaction => {
             if (!receiver.loggedIn) return interaction.reply({ content: '❌ ผู้รับยังไม่ได้เข้าสู่ระบบ!', ephemeral: true });
             if (ud.balance < amount) return interaction.reply({ content: `❌ เงินไม่พอ! มีแค่ ${ud.balance.toLocaleString()} บาท`, ephemeral: true });
             updateUser(user.id, { balance: ud.balance - amount }); updateUser(receiverId, { balance: receiver.balance + amount });
+            addInbox(receiverId, '💸', `ได้รับโอนเงิน **${amount.toLocaleString()} บาท** จาก **${ud.charName || 'ไม่ทราบ'}**`);
             await interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('💸 โอนเงินสำเร็จ!').addFields({ name: '📥 ผู้รับ', value: receiver.charName || receiverId, inline: true }, { name: '💵 จำนวน', value: `${amount.toLocaleString()} บาท`, inline: true }, { name: '💰 เงินคงเหลือ', value: `${(ud.balance - amount).toLocaleString()} บาท`, inline: true }).setTimestamp()], ephemeral: true });
             return interaction.message.edit(buildFinancePanel(user.id));
         }
@@ -1557,6 +1733,7 @@ client.on('interactionCreate', async interaction => {
         if (customId === 'modal_lottery_buy') {
             if (!requireLogin(interaction)) return;
             const ud = getUser(user.id);
+            if (!checkPIN(interaction, ud)) return;
             const numRaw = interaction.fields.getTextInputValue('number').trim();
             const qtyRaw = interaction.fields.getTextInputValue('qty').trim();
             const num = parseInt(numRaw);
@@ -1598,8 +1775,61 @@ client.on('interactionCreate', async interaction => {
             });
         }
 
+        // ── Settings modals ───────────────────────────────────────────────────
+        if (customId === 'modal_set_pin') {
+            const ud = getUser(user.id);
+            const newPin     = interaction.fields.getTextInputValue('pin').trim();
+            const confirmPin = interaction.fields.getTextInputValue('confirm_pin').trim();
+            if (!/^\d{4,6}$/.test(newPin))
+                return interaction.reply({ content: '❌ PIN ต้องเป็นตัวเลข 4–6 หลักเท่านั้น!', ephemeral: true });
+            if (newPin !== confirmPin)
+                return interaction.reply({ content: '❌ PIN ทั้งสองช่องไม่ตรงกัน! ลองอีกครั้ง', ephemeral: true });
+            if (ud.pinHash) {
+                const oldPin = interaction.fields.getTextInputValue('old_pin').trim();
+                if (hashPassword(oldPin) !== ud.pinHash)
+                    return interaction.reply({ content: '❌ PIN เดิมไม่ถูกต้อง!', ephemeral: true });
+            }
+            updateUser(user.id, { pinHash: hashPassword(newPin) });
+            return interaction.reply({
+                embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('🔢 ตั้ง PIN สำเร็จ!')
+                    .setDescription('PIN ของคุณถูกบันทึกเรียบร้อยแล้ว\nใช้ยืนยันธุรกรรมสำคัญในอนาคต')
+                    .setTimestamp()],
+                ephemeral: true,
+            });
+        }
+
+        if (customId === 'modal_set_bio') {
+            const bio = interaction.fields.getTextInputValue('bio').trim();
+            updateUser(user.id, { bio: bio || null });
+            return interaction.reply({
+                embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle(bio ? '📝 ตั้ง Bio สำเร็จ!' : '📝 ล้าง Bio สำเร็จ!')
+                    .setDescription(bio ? `Bio ใหม่: "${bio}"` : 'Bio ของคุณถูกล้างแล้ว')
+                    .setTimestamp()],
+                ephemeral: true,
+            });
+        }
+
+        if (customId === 'modal_set_embed') {
+            const raw = interaction.fields.getTextInputValue('color').trim().replace(/^#/, '');
+            if (raw === '') {
+                updateUser(user.id, { embedColor: null });
+                return interaction.reply({ content: '🎨 รีเซ็ตสี Embed เป็นค่าเริ่มต้นแล้ว', ephemeral: true });
+            }
+            if (!/^[0-9a-fA-F]{6}$/.test(raw))
+                return interaction.reply({ content: '❌ สี Hex ไม่ถูกต้อง!\nใส่แบบ `FF5733` หรือ `#FF5733` (6 หลัก HEX)', ephemeral: true });
+            const colorNum = parseInt(raw, 16);
+            updateUser(user.id, { embedColor: colorNum });
+            return interaction.reply({
+                embeds: [new EmbedBuilder().setColor(colorNum).setTitle('🎨 ตั้งสี Embed สำเร็จ!')
+                    .setDescription(`สีใหม่: **#${raw.toUpperCase()}**\nEmbed ทั้งหมดของคุณจะใช้สีนี้`)
+                    .setTimestamp()],
+                ephemeral: true,
+            });
+        }
+
         if (customId === 'modal_stock_buy') {
             const ud = getUser(user.id); const stocks = loadStocks();
+            if (!checkPIN(interaction, ud)) return;
             const sym = interaction.fields.getTextInputValue('symbol').trim().toUpperCase();
             const amt = parseInt(interaction.fields.getTextInputValue('amount'));
             if (!stocks[sym]) return interaction.reply({ content: `❌ ไม่พบหุ้น **${sym}**\nใช้: SKBD, BREAD, GOLD, DBANK, FARM, TECH`, ephemeral: true });
@@ -1618,6 +1848,7 @@ client.on('interactionCreate', async interaction => {
 
         if (customId === 'modal_stock_sell') {
             const ud = getUser(user.id); const stocks = loadStocks();
+            if (!checkPIN(interaction, ud)) return;
             const sym = interaction.fields.getTextInputValue('symbol').trim().toUpperCase();
             const amt = parseInt(interaction.fields.getTextInputValue('amount'));
             if (!stocks[sym]) return interaction.reply({ content: `❌ ไม่พบหุ้น **${sym}**`, ephemeral: true });
@@ -1753,6 +1984,7 @@ async function handleFire(interaction, targetUser) {
         } catch {}
     }
 
+    addInbox(targetUser.id, '🚪', `ถูกออกจากงานที่ร้าน **${ud.shop}** (ตำแหน่ง: ${fired.role})`);
     try { await targetUser.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setTitle('📋 แจ้งออกจากงาน').setDescription(`คุณถูกออกจากงานที่ร้าน **${ud.shop}** แล้ว`).setTimestamp()] }); } catch {}
 
     await interaction.reply({ embeds: [new EmbedBuilder().setColor(0xff0000).setTitle('🚪 ไล่พนักงานออกสำเร็จ!').addFields({ name: '👤 พนักงานที่ออก', value: `<@${targetUser.id}>`, inline: true }, { name: '👔 ตำแหน่งเดิม', value: fired.role, inline: true }, { name: '👥 คงเหลือ', value: `${staff.length} คน`, inline: true }).setTimestamp()], ephemeral: true });
